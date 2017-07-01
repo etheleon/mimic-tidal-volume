@@ -1,0 +1,274 @@
+```postgres
+psql -d mimic -U datathon
+select * from pg_stat_activity;
+select pg_terminate_backend(3682);
+
+#loging into postgres
+set search_path to public,mimiciii;
+\i instructions
+```
+
+```{r misc}
+options(max.print=999)
+```
+
+```{r libraries}
+library(future)
+library(magrittr)
+library(colorout)
+library(RPostgreSQL)
+library(tidyverse)
+library(dbplyr)
+
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, dbname = "mimic",
+             host = "localhost", port = 5432,
+             user = "datathon", password = "datathon")
+```
+
+
+```{r custoFunctions}
+PBW = function(gender, height){
+    if (!is.na(height) && !is.na(gender)){ 
+        if (gender == 'M'){ 
+            50.0 + 0.91 * (height  - 152.4) 
+        }else{ 
+            45.5 + 0.91 * (height  - 152.4) } 
+        }else{ 
+            NA } 
+}
+
+#' calculates table
+#'
+#' @param df the input data.frame
+#' @param ids the icustay_ids
+#'
+tableFXN = function(df, ids){
+    if(missing(ids)){
+        tdf = df
+    }else{
+        tdf = df %>% filter(icustay_id %in% ids)
+    }
+    mapply(function(lower, upper){
+        count = tdf %>%
+            filter(tv_pbw >= lower, tv_pbw < upper) %>% nrow
+        data.frame(lower = lower, upper = upper, count=count)
+    },
+        lower = c(0, 6, 8, 10),
+        upper = c(6, 8, 10, Inf),
+        SIMPLIFY=FALSE
+    ) %>% do.call(rbind,.)
+}
+
+#' Searches the table materialized view tables
+#'
+#' @param regex text
+findWhichTable = function(regex){
+    namesDF.materialized %<>% do.call(rbind,.)
+    whichones =  namesDF.materialized %$%
+        columns  %>% as.character %>% grepl(regex,.)
+    namesDF.materialized[whichones,]
+}
+```
+
+
+```{r names}
+##################################################
+# Tables
+##################################################
+namesDF = dbListTables(con) %>% lapply(function(tbl){
+    data.frame(tbl = tbl, columns = colnames(tbl(con, tbl)))
+})
+names(namesDF) = dbListTables(con)
+
+##################################################
+# Materialized Views
+##################################################
+
+#names
+materializedViews = c("adenosinedurations", "angus_sepsis", "apsiii", "bloodgasfirstday", "bloodgasfirstdayarterial", "dobutaminedurations", "dopaminedurations", "echodata", "elixhauser_ahrq", "elixhauser_ahrq_score", "elixhauser_quan", "elixhauser_quan_score", "epinephrinedurations", "gcsfirstday", "heightfirstday", "icustay_detail", "isupreldurations", "labsfirstday", "lods", "milrinonedurations", "norepinephrinedurations", "oasis", "phenylephrinedurations", "rrtfirstday", "saps", "sapsii", "sofa", "uofirstday", "vasopressindurations", "vasopressordurations", "ventfirstday", "vitalsfirstday", "weightfirstday")
+namesDF.materialized = materializedViews %>% lapply(function(tbl){
+    data.frame( tbl = tbl, columns = colnames(tbl(con, sql(sprintf("select * from %s", tbl)))))
+})
+names(namesDF.materialized) = materializedViews
+
+#df
+materialized = materializedViews %>% lapply(
+function(tbl){
+    con %>% tbl(sql(sprintf("select * from %s", tbl))) %>% collect(n = Inf)
+})
+names(materialized) = materializedViews
+```
+
+```{r dataSets, eval=FALSE}
+apache = materialized$apsiii %>% select(subject_id:apsiii_prob)
+oasis = con %>% tbl("oasis") %>% select(subject_id, icustay_id, oasis, oasis_prob) %>% collect(n=Inf)
+#write.csv(apache, file="/Data/common/apache.csv")
+#write.csv(oasis, file="/Data/common/oasis.csv")
+```
+
+## 1. ideal body weight
+
+```{r IBW}
+#gender, ethnicity
+stats   = materialized %$% icustay_detail
+patient2icuID = stats %>% select(subject_id, icustay_id)
+
+weight  = materialized %$% weightfirstday %>% select(icustay_id, weight_admit)
+
+height  = materialized %$% heightfirstday %>% select(icustay_id, height)
+
+#pbw - predicted body weight
+pbwDF   = merge(stats %>% select(icustay_id, gender, ethnicity), height, all=T)
+pbwDF %<>% rowwise %>% mutate(pbw = PBW(gender, height))
+pbwDF = pbwDF %>% complete.cases %>% pbwDF[.,]
+```
+
+## 2. Cohort 2008-2012 Metavision
+
+```{r metavision}
+## 2. Time Period 2008-2012
+metavisionPatients = con %>% tbl("icustays") %>%
+    filter(dbsource == 'metavision') %>%
+    pull(icustay_id)
+```
+
+# 3. Tidal Volume (cm3/kg)
+
+```{r ventilation-TV}
+## Tidal Volume
+
+#' tvSet Finds the set tidal volume
+tv_Set = function(){
+    con %>% tbl("mpwr_vent_unpivot") %>%
+        filter(!is.na(tidal_volume_set)) %>% collect(n=Inf) %>%
+        group_by(icustay_id) %>% summarise(tv_set = head(tidal_volume_set, n=1)) %>%
+        merge(pbwDF, by="icustay_id") %>%
+        mutate(tv_pbw = tv_set / pbw) %>% tbl_df
+}
+tvSet = tv_Set()
+
+#' tvSet Finds the observed tidal volume
+tv_Observed = function(){
+    con %>% tbl("mpwr_vent_unpivot") %>%
+        filter(!is.na(tidal_volume_observed)) %>% collect(n=Inf) %>%
+        group_by(icustay_id) %>% summarise(tv_set= head(tidal_volume_observed, n=1)) %>%
+        merge(pbwDF, by="icustay_id") %>% mutate(tv_pbw = tv_set / pbw) %>% tbl_df
+}
+tvObserved = tv_Observed()
+
+tvSet %>% tableFXN
+tvObserved %>% tableFXN
+
+# pdf("hist.pdf", w=10, h=10)
+# ggplot(filter(tvSet,tv_pbw > 0, tv_pbw < 30), aes(x=tv_pbw)) + geom_histogram() +
+# scale_x_continuous(breaks=seq(0,30, 1))
+# dev.off()
+```
+
+# 4 Just First visit - Patient Count
+
+```{r firstVisit}
+firstVisit = con %>% tbl("mpwr_chartevents_vent") %>%
+    merge(patient2icuID, by="icustay_id", all.x=T) %>% 
+    group_by(subject_id) %>%
+    do(head(arrange(., charttime),n=1))
+
+firstVisitID = firstVisit %>% pull(icustay_id)
+```
+
+# 5 Duration > 48hr
+
+```{r above48}
+above48_icuIDs = con %>% tbl("ventdurations") %>%
+    filter(duration_hours > 48) %>% pull(icustay_id)
+```
+
+# 6 peeps and pao2fio
+
+```{r peepsNfio}
+peepIDs =  con %>% tbl("pao2fio2peep") %>% select(icustay_id, peep, pao2fio2) %>% 
+    filter(peep >= 5, pao2fio2 <= 300) %>% pull(icustay_id)
+```
+
+# 7 Ventilation mode
+
+```{r ventilation-mode}
+## Ventmode
+ventMetaVision = con %>% tbl("mpwr_chartevents_vent") %>%
+    filter(itemid %in% c(720, 223849)) %>% collect(n=Inf)
+annotatedModes = read.csv("/home/team12user7/WESLEY/vent_matt.csv") %>% filter(X == 1)
+ventModeIDS = ventMetaVision %>% filter(value %in% annotatedModes$ventMode) %>% tbl_df %>% pull(icustay_id)
+
+ventModes_Full = ventMetaVision
+    pull(value) %>% table %>% as.data.frame  %>% arrange(desc(Freq)) %>%
+    setNames(c("ventMode", "Freq"))
+
+#ventMetaVision_withSubject = ventMetaVision %>% merge(patient2icuID, all.x=T)
+
+# ventModes_metavision = con %>% tbl("mpwr_chartevents_vent") %>%
+#     filter(itemid %in% c(720, 223849)) %>% collect(n=Inf) %>%
+#     filter(icustay_id %in% metavisionPatients) %>%
+#     pull(value) %>% table %>% as.data.frame  %>% arrange(desc(Freq)) %>% 
+#     setNames(c("ventMode", "Freq"))
+#write.csv(ventModes_metavision, file="/Data/common/ventmodes_metavision.csv")
+
+```
+# Filtered Table
+
+```{r tidalVolumeSet}
+tvSet_filtered <-
+tvSet %>%
+    filter(icustay_id %in% unique(metavisionPatients)) %>%
+    filter(icustay_id %in% unique(firstVisitID)) %>%
+    filter(icustay_id %in% unique(above48_icuIDs)) %>%
+    filter(icustay_id %in% unique(peepIDs)) %>% 
+    filter(icustay_id %in% unique(ventModeIDS)) %>% tableFXN
+write.csv(tvSet_filtered, file="/Data/common/tvSet_filtered.csv", row.names=F)
+tvSet_filtered %>% tableFXN()
+```
+
+```{r tidalVolumeObserved}
+tvObserved_filtered <-
+tvObserved %>% #tableFXN(id = metavisionPatients)
+    filter(icustay_id %in% unique(metavisionPatients)) %>%
+    filter(icustay_id %in% unique(firstVisitID)) %>%
+    filter(icustay_id %in% unique(above48_icuIDs)) %>%
+    filter(icustay_id %in% unique(peepIDs)) %>% tableFXN
+    filter(icustay_id %in% unique(ventModeIDS))
+write.csv(tvObserved_filtered, file="/Data/common/tvObserved_filtered.csv", row.names=F)
+tvObserved_filtered %>% tableFXN()
+```
+
+
+undone
+
+```{r mortality}
+mortalityDF = con %>% tbl("admissions") %>% select(subject_id, deathtime)
+allData = con %>% tbl("mpwr_vent_unpivot") %>% select(icustay_id, tidal_volume:tidal_volume_observed) %>% collect(n=Inf)
+allData %>% filter(tidal_volume_spont == tidal_volume_set)
+vent_unpivot = con %>% tbl("mpwr_vent_unpivot") %>% collect(n = Inf)
+```
+
+
+
+
+
+
+
+
+admissions <- tbl(con, )
+admissions %>% head
+
+
+
+
+# APACHE
+# Height
+# Weight
+
+
+#TV in 0 - 48hr
+
+#predicted body weight
+```
