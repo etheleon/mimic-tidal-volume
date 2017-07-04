@@ -12,20 +12,6 @@ set search_path to public,mimiciii;
 options(max.print=999)
 ```
 
-```{r libraries}
-library(future)
-library(magrittr)
-library(colorout)
-library(RPostgreSQL)
-library(tidyverse)
-library(dbplyr)
-
-drv <- dbDriver("PostgreSQL")
-con <- dbConnect(drv, dbname = "mimic",
-             host = "localhost", port = 5432,
-             user = "datathon", password = "datathon")
-```
-
 
 ```{r custoFunctions}
 PBW = function(gender, height){
