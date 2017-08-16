@@ -1,3 +1,35 @@
+
+Before running the following you'll need to set up the materialize views
+
+General materialize views from the mimic github repo
+
+```bash
+MIMICREPO=/path/to/your/mimic/repo
+cd $MIMICREPO/concepts
+psql --username <urusername --dbname mimic 
+```
+
+```postgres
+set search_path to public,mimiciii;
+\i make-concepts.sql
+```
+
+Private scripts from Alistaire
+
+```bash
+TIDAL=/path/to/tidal/volume/mimic/repo
+cd $TIDAL/scripts/sql
+psql --username <urusername --dbname mimic
+```
+
+```postgres
+set search_path to public,mimiciii;
+\i mpwr-trach.sql
+\i mpwr-vent-settings.sql
+\i mpwr-vent-unipivot.sql
+\i pao2fio2.sql
+```
+
 ```postgres
 psql -d mimic -U datathon
 select * from pg_stat_activity;
